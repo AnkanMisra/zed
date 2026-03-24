@@ -35009,3 +35009,234 @@ async fn test_align_selections_multicolumn(cx: &mut TestAppContext) {
     cx.update_editor(|e, window, cx| e.align_selections(&AlignSelections, window, cx));
     cx.assert_editor_state(after);
 }
+
+#[gpui::test]
+async fn test_fold_fingerprint_proximity_search(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+    let workspace_id = db.next_id().await.unwrap();
+    let editor_db = cx.update(|cx| EditorDb::global(cx));
+
+    // Two folds share the same sfp (duplicate start fingerprint).
+    // The fold we stored is the SECOND occurrence. After a prepend, the
+    // old scan-from-start algorithm would match the first occurrence;
+    // the proximity search should find the second.
+    let shared_sfp = "fn handle_request(data: &str) ->"; // 32 chars
+    let fold1_body = " Result<()> {\n    log(data);\n    ";
+    let fold1_efp = "    Ok(())\n} // end handler_one!";
+    let between = "\n\n";
+    let fold2_body = " Response {\n    let parsed = go(data);\n    ";
+    let fold2_efp = " respond(parsed)\n} // handler_2!";
+
+    assert_eq!(shared_sfp.len(), 32);
+    assert_eq!(fold1_efp.len(), 32);
+    assert_eq!(fold2_efp.len(), 32);
+
+    let prefix = "// header\nuse std::io;\n\n";
+    let suffix = "\n\nfn main() {}\n";
+    let original = format!(
+        "{prefix}{shared_sfp}{fold1_body}{fold1_efp}{between}\
+         {shared_sfp}{fold2_body}{fold2_efp}{suffix}"
+    );
+
+    // We only fold the SECOND occurrence
+    let fold2_start = prefix.len()
+        + shared_sfp.len()
+        + fold1_body.len()
+        + fold1_efp.len()
+        + between.len();
+    let fold2_end = fold2_start + shared_sfp.len() + fold2_body.len() + fold2_efp.len();
+
+    let file_path: Arc<Path> =
+        Arc::from(Path::new(&format!("/tmp/test_proximity_{:?}.rs", workspace_id)));
+    editor_db
+        .save_file_folds(
+            workspace_id,
+            file_path.clone(),
+            vec![(
+                fold2_start,
+                fold2_end,
+                shared_sfp.to_string(),
+                fold2_efp.to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // Prepend content to shift all offsets
+    let prepend = "// added comment block\n// more comments here\n// even more\n";
+    let modified = format!("{prepend}{original}");
+    let shift = prepend.len();
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple(&modified, cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.load_folds_from_db(workspace_id, file_path.as_ref().into(), window, cx);
+    });
+
+    // The fold must be on the SECOND occurrence, not the first
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let display_snapshot = editor.display_snapshot(cx);
+        let folds: Vec<_> = display_snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.len())
+            .collect();
+        assert_eq!(folds.len(), 1, "Expected 1 fold to be restored");
+
+        let fold_start = folds[0].range.start.to_offset(&snapshot);
+        let fold_end = folds[0].range.end.to_offset(&snapshot);
+        assert_eq!(
+            fold_start,
+            MultiBufferOffset(fold2_start + shift),
+            "Fold should match the second occurrence, not the first"
+        );
+        assert_eq!(fold_end, MultiBufferOffset(fold2_end + shift));
+    });
+}
+
+#[gpui::test]
+async fn test_fold_fingerprint_duplicate_patterns(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+    let workspace_id = db.next_id().await.unwrap();
+    let editor_db = cx.update(|cx| EditorDb::global(cx));
+
+    // Two identical function bodies — the fingerprints are the same for both
+    let function_sfp = "fn process_request_handler(req: ";
+    let function_body = "Data) -> Result<()> {\n    let parsed = parse(req);\n    ";
+    let function_efp = "Ok(save_to_db(parsed)?)\n} // end";
+    assert_eq!(function_sfp.len(), 32);
+    assert_eq!(function_efp.len(), 32);
+
+    let function_text = format!("{function_sfp}{function_body}{function_efp}");
+    let function_len = function_text.len();
+
+    // Build content: header, function1, separator, function2, suffix
+    let header = "use std::io;\n\n";
+    let separator = "\n\n";
+    let suffix = "\n\nfn main() {}\n";
+    let content = format!(
+        "{header}{function_text}{separator}{function_text}{suffix}"
+    );
+
+    // We want to fold the SECOND occurrence
+    let second_start = header.len() + function_len + separator.len();
+    let second_end = second_start + function_len;
+
+    let file_path: Arc<Path> = Arc::from(Path::new(&format!("/tmp/test_duplicates_{:?}.rs", workspace_id)));
+    editor_db
+        .save_file_folds(
+            workspace_id,
+            file_path.clone(),
+            vec![(
+                second_start,
+                second_end,
+                function_sfp.to_string(),
+                function_efp.to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // Prepend content to shift offsets by a moderate amount (less than distance
+    // between the two functions, so the first occurrence doesn't drift past
+    // stored_start).
+    let prepend = "// license header\n// copyright notice\n";
+    let modified = format!("{prepend}{content}");
+    let shift = prepend.len();
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple(&modified, cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.load_folds_from_db(workspace_id, file_path.as_ref().into(), window, cx);
+    });
+
+    // The fold should be on the SECOND occurrence, not the first
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let display_snapshot = editor.display_snapshot(cx);
+        let folds: Vec<_> = display_snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.len())
+            .collect();
+        assert_eq!(folds.len(), 1, "Expected 1 fold to be restored");
+
+        let fold_start = folds[0].range.start.to_offset(&snapshot);
+        let fold_end = folds[0].range.end.to_offset(&snapshot);
+        assert_eq!(
+            fold_start,
+            MultiBufferOffset(second_start + shift),
+            "Fold should match the second occurrence, not the first"
+        );
+        assert_eq!(fold_end, MultiBufferOffset(second_end + shift));
+    });
+}
+
+#[gpui::test]
+async fn test_fold_fingerprint_out_of_bounds_discarded(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+    let workspace_id = db.next_id().await.unwrap();
+    let editor_db = cx.update(|cx| EditorDb::global(cx));
+
+    // Short fold where sfp == efp (fold < 32 bytes), near end of file.
+    // Store offsets from a longer version so fold_len exceeds available space.
+    let short_fold_text = "/* collapsed */";
+    let padded_fold_text = format!("{short_fold_text}extra_padding_that_increases_len");
+    let original_with_padding = format!(
+        "fn main() {{\n    println!(\"hello\");\n}}\n\n{padded_fold_text}\nmore_stuff\n"
+    );
+    let padded_fold_start = original_with_padding.find(short_fold_text).unwrap();
+    let padded_fold_end = padded_fold_start + padded_fold_text.len();
+
+    let file_path: Arc<Path> = Arc::from(Path::new(&format!("/tmp/test_oob_{:?}.rs", workspace_id)));
+    editor_db
+        .save_file_folds(
+            workspace_id,
+            file_path.clone(),
+            vec![(
+                padded_fold_start,
+                padded_fold_end,
+                short_fold_text.to_string(),
+                short_fold_text.to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // Truncated buffer: fingerprint exists but new_end would exceed buffer length
+    let truncated = format!(
+        "fn main() {{\n    println!(\"hello\");\n}}\n\n{short_fold_text}\n"
+    );
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple(&truncated, cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.load_folds_from_db(workspace_id, file_path.as_ref().into(), window, cx);
+    });
+
+    // Fold should be discarded (out of bounds), not placed
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let display_snapshot = editor.display_snapshot(cx);
+        let folds: Vec<_> = display_snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.len())
+            .collect();
+        assert_eq!(
+            folds.len(),
+            0,
+            "Out-of-bounds fold should be discarded, not placed"
+        );
+    });
+}

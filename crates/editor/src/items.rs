@@ -1417,6 +1417,7 @@ pub struct RestorationData {
     pub scroll_position: (BufferRow, gpui::Point<ScrollOffset>),
     pub folds: Vec<Range<Point>>,
     pub selections: Vec<Range<Point>>,
+    pub buffer_byte_len: Option<usize>,
 }
 
 impl ProjectItem for Editor {
@@ -1447,12 +1448,17 @@ impl ProjectItem for Editor {
                 })
         {
             if !restoration_data.folds.is_empty() {
-                editor.fold_ranges(
-                    clip_ranges(&restoration_data.folds, snapshot),
-                    false,
-                    window,
-                    cx,
-                );
+                let buffer_changed = restoration_data
+                    .buffer_byte_len
+                    .is_some_and(|len| len != snapshot.len());
+                if !buffer_changed {
+                    editor.fold_ranges(
+                        clip_ranges(&restoration_data.folds, snapshot),
+                        false,
+                        window,
+                        cx,
+                    );
+                }
             }
             if !restoration_data.selections.is_empty() {
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
