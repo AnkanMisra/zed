@@ -25524,137 +25524,9 @@ impl Editor {
 
             if let Some(folds) = folds {
                 let snapshot = buffer_snapshot.get_or_init(|| self.buffer.read(cx).snapshot(cx));
-                let snapshot_len = snapshot.len().0;
 
-                // Find all positions in the buffer where `fingerprint` matches.
-                let find_all_fingerprints = |fingerprint: &str| -> Vec<usize> {
-                    let search_end = snapshot_len.saturating_sub(fingerprint.len());
-                    let mut results = Vec::new();
-                    let mut byte_offset = 0usize;
-                    for ch in snapshot.chars_at(MultiBufferOffset(0)) {
-                        if byte_offset > search_end {
-                            break;
-                        }
-                        if snapshot.contains_str_at(MultiBufferOffset(byte_offset), fingerprint) {
-                            results.push(byte_offset);
-                        }
-                        byte_offset += ch.len_utf8();
-                    }
-                    results
-                };
-
-                let mut search_start = 0usize;
-                let mut observed_shift: isize = 0;
-
-                // Collect db_folds for migration (only folds with valid fingerprints)
-                let mut db_folds_for_migration: Vec<(usize, usize, String, String)> = Vec::new();
-
-                let valid_folds: Vec<_> = folds
-                    .into_iter()
-                    .filter_map(|(stored_start, stored_end, start_fp, end_fp)| {
-                        // Skip folds without fingerprints (old data before migration)
-                        let sfp = start_fp?;
-                        let efp = end_fp?;
-                        let efp_len = efp.len();
-                        let sfp_len = sfp.len();
-                        let fold_len = stored_end - stored_start;
-
-                        // Fast path: check if fingerprints match at stored offsets
-                        let start_matches = stored_start < snapshot_len
-                            && snapshot.contains_str_at(MultiBufferOffset(stored_start), &sfp);
-                        let efp_check_pos = stored_end.saturating_sub(efp_len);
-                        let end_matches = efp_check_pos >= stored_start
-                            && stored_end <= snapshot_len
-                            && snapshot.contains_str_at(MultiBufferOffset(efp_check_pos), &efp);
-
-                        let (new_start, new_end) = if start_matches && end_matches {
-                            (stored_start, stored_end)
-                        } else {
-                            let expected_start = (stored_start as isize + observed_shift)
-                                .max(0) as usize;
-
-                            let sfp_matches = find_all_fingerprints(&sfp);
-                            if sfp_matches.is_empty() {
-                                return None;
-                            }
-
-                            if sfp == efp {
-                                let new_start = sfp_matches
-                                    .iter()
-                                    .copied()
-                                    .filter(|&pos| pos >= search_start)
-                                    .min_by_key(|&pos| {
-                                        (pos as isize - expected_start as isize).unsigned_abs()
-                                    })?;
-                                let new_end = new_start + fold_len;
-                                (new_start, new_end)
-                            } else {
-                                let efp_expected_offset = fold_len.saturating_sub(efp_len);
-                                let mut validated: Vec<(usize, usize)> = sfp_matches
-                                    .iter()
-                                    .copied()
-                                    .filter(|&pos| pos >= search_start)
-                                    .filter_map(|start_pos| {
-                                        let end_fp_pos = start_pos + efp_expected_offset;
-                                        let end_pos = end_fp_pos + efp_len;
-                                        if end_pos <= snapshot_len
-                                            && snapshot.contains_str_at(
-                                                MultiBufferOffset(end_fp_pos),
-                                                &efp,
-                                            )
-                                        {
-                                            Some((start_pos, end_pos))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-
-                                if validated.is_empty() {
-                                    let efp_matches = find_all_fingerprints(&efp);
-                                    validated = sfp_matches
-                                        .iter()
-                                        .copied()
-                                        .filter(|&pos| pos >= search_start)
-                                        .filter_map(|start_pos| {
-                                            let after_sfp = start_pos + sfp_len;
-                                            efp_matches
-                                                .iter()
-                                                .copied()
-                                                .filter(|&ep| ep >= after_sfp)
-                                                .min()
-                                                .map(|ep| (start_pos, ep + efp_len))
-                                        })
-                                        .collect();
-                                }
-
-                                let (new_start, new_end) = validated
-                                    .into_iter()
-                                    .min_by_key(|&(pos, _)| {
-                                        (pos as isize - expected_start as isize).unsigned_abs()
-                                    })?;
-                                (new_start, new_end)
-                            }
-                        };
-
-                        if new_end <= new_start || new_end > snapshot_len {
-                            return None;
-                        }
-
-                        observed_shift = new_start as isize - stored_start as isize;
-                        search_start = new_end;
-
-                        // Collect for migration if needed
-                        if needs_migration {
-                            db_folds_for_migration.push((new_start, new_end, sfp, efp));
-                        }
-
-                        Some(
-                            snapshot.clip_offset(MultiBufferOffset(new_start), Bias::Left)
-                                ..snapshot.clip_offset(MultiBufferOffset(new_end), Bias::Right),
-                        )
-                    })
-                    .collect();
+                let (valid_folds, migration_folds) =
+                    Self::reconstruct_fold_positions(snapshot, folds);
 
                 if !valid_folds.is_empty() {
                     self.fold_ranges(valid_folds, false, window, cx);
@@ -25665,7 +25537,7 @@ impl Editor {
                             let path = path.clone();
                             let db = EditorDb::global(cx);
                             cx.spawn(async move |_, _| {
-                                db.save_file_folds(workspace_id, path, db_folds_for_migration)
+                                db.save_file_folds(workspace_id, path, migration_folds)
                                     .await
                                     .log_err();
                             })
@@ -25694,8 +25566,159 @@ impl Editor {
         self.read_scroll_position_from_db(item_id, workspace_id, window, cx);
     }
 
-    /// Load folds from the file_folds database table by file path.
-    /// Used when manually opening a file that was previously closed.
+    fn reconstruct_fold_positions(
+        snapshot: &MultiBufferSnapshot,
+        folds: Vec<(usize, usize, Option<String>, Option<String>)>,
+    ) -> (Vec<Range<MultiBufferOffset>>, Vec<(usize, usize, String, String)>) {
+        let snapshot_len = snapshot.len().0;
+
+        let mut fingerprint_cache: HashMap<String, Vec<usize>> = HashMap::default();
+
+        let find_all_fingerprints = |fingerprint: &str, cache: &mut HashMap<String, Vec<usize>>| -> Vec<usize> {
+            if let Some(cached) = cache.get(fingerprint) {
+                return cached.clone();
+            }
+            let search_end = snapshot_len.saturating_sub(fingerprint.len());
+            let mut results = Vec::new();
+            let mut byte_offset = 0usize;
+            for ch in snapshot.chars_at(MultiBufferOffset(0)) {
+                if byte_offset > search_end {
+                    break;
+                }
+                if snapshot.contains_str_at(MultiBufferOffset(byte_offset), fingerprint) {
+                    results.push(byte_offset);
+                }
+                byte_offset += ch.len_utf8();
+            }
+            cache.insert(fingerprint.to_string(), results.clone());
+            results
+        };
+
+        let mut search_start = 0usize;
+        let mut observed_shift: isize = 0;
+        let mut migration_folds: Vec<(usize, usize, String, String)> = Vec::new();
+
+        let valid_folds: Vec<_> = folds
+            .into_iter()
+            .filter_map(|(stored_start, stored_end, start_fp, end_fp)| {
+                let start_fingerprint = start_fp?;
+                let end_fingerprint = end_fp?;
+                let end_fingerprint_len = end_fingerprint.len();
+                let start_fingerprint_len = start_fingerprint.len();
+                let fold_len = stored_end - stored_start;
+
+                let start_matches = stored_start < snapshot_len
+                    && snapshot.contains_str_at(MultiBufferOffset(stored_start), &start_fingerprint);
+                let end_fp_check_pos = stored_end.saturating_sub(end_fingerprint_len);
+                let end_matches = end_fp_check_pos >= stored_start
+                    && stored_end <= snapshot_len
+                    && snapshot.contains_str_at(MultiBufferOffset(end_fp_check_pos), &end_fingerprint);
+
+                let (new_start, new_end) = if start_matches && end_matches {
+                    (stored_start, stored_end)
+                } else {
+                    let expected_start = (stored_start as isize + observed_shift)
+                        .max(0) as usize;
+
+                    let start_fp_matches = find_all_fingerprints(&start_fingerprint, &mut fingerprint_cache);
+                    if start_fp_matches.is_empty() {
+                        return None;
+                    }
+
+                    if start_fingerprint == end_fingerprint {
+                        // When both fingerprints are identical (fold shorter than 64 bytes),
+                        // validate that the end fingerprint exists at the expected end position
+                        // to avoid restoring a fold whose interior was edited.
+                        let new_start = start_fp_matches
+                            .iter()
+                            .copied()
+                            .filter(|&pos| pos >= search_start)
+                            .filter(|&pos| {
+                                let candidate_end = pos + fold_len;
+                                let end_fp_pos = candidate_end.saturating_sub(end_fingerprint_len);
+                                end_fp_pos >= pos
+                                    && candidate_end <= snapshot_len
+                                    && snapshot.contains_str_at(
+                                        MultiBufferOffset(end_fp_pos),
+                                        &end_fingerprint,
+                                    )
+                            })
+                            .min_by_key(|&pos| {
+                                (pos as isize - expected_start as isize).unsigned_abs()
+                            })?;
+                        let new_end = new_start + fold_len;
+                        (new_start, new_end)
+                    } else {
+                        let end_fp_expected_offset = fold_len.saturating_sub(end_fingerprint_len);
+                        let mut validated: Vec<(usize, usize)> = start_fp_matches
+                            .iter()
+                            .copied()
+                            .filter(|&pos| pos >= search_start)
+                            .filter_map(|start_pos| {
+                                let end_fp_pos = start_pos + end_fp_expected_offset;
+                                let end_pos = end_fp_pos + end_fingerprint_len;
+                                if end_pos <= snapshot_len
+                                    && snapshot.contains_str_at(
+                                        MultiBufferOffset(end_fp_pos),
+                                        &end_fingerprint,
+                                    )
+                                {
+                                    Some((start_pos, end_pos))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        if validated.is_empty() {
+                            // End fingerprint may have shifted independently of the start
+                            // (e.g., lines inserted inside the fold). Pair each start match
+                            // with the nearest subsequent end fingerprint match.
+                            let end_fp_matches = find_all_fingerprints(&end_fingerprint, &mut fingerprint_cache);
+                            validated = start_fp_matches
+                                .iter()
+                                .copied()
+                                .filter(|&pos| pos >= search_start)
+                                .filter_map(|start_pos| {
+                                    let after_start = start_pos + start_fingerprint_len;
+                                    end_fp_matches
+                                        .iter()
+                                        .copied()
+                                        .filter(|&ep| ep >= after_start)
+                                        .min()
+                                        .map(|ep| (start_pos, ep + end_fingerprint_len))
+                                })
+                                .collect();
+                        }
+
+                        let (new_start, new_end) = validated
+                            .into_iter()
+                            .min_by_key(|&(pos, _)| {
+                                (pos as isize - expected_start as isize).unsigned_abs()
+                            })?;
+                        (new_start, new_end)
+                    }
+                };
+
+                if new_end <= new_start || new_end > snapshot_len {
+                    return None;
+                }
+
+                observed_shift = new_start as isize - stored_start as isize;
+                search_start = new_end;
+
+                migration_folds.push((new_start, new_end, start_fingerprint, end_fingerprint));
+
+                Some(
+                    snapshot.clip_offset(MultiBufferOffset(new_start), Bias::Left)
+                        ..snapshot.clip_offset(MultiBufferOffset(new_end), Bias::Right),
+                )
+            })
+            .collect();
+
+        (valid_folds, migration_folds)
+    }
+
     fn load_folds_from_db(
         &mut self,
         workspace_id: WorkspaceId,
@@ -25721,134 +25744,7 @@ impl Editor {
         }
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let snapshot_len = snapshot.len().0;
-
-        // Find all positions in the buffer where `fingerprint` matches.
-        let find_all_fingerprints = |fingerprint: &str| -> Vec<usize> {
-            let search_end = snapshot_len.saturating_sub(fingerprint.len());
-            let mut results = Vec::new();
-            let mut byte_offset = 0usize;
-            for ch in snapshot.chars_at(MultiBufferOffset(0)) {
-                if byte_offset > search_end {
-                    break;
-                }
-                if snapshot.contains_str_at(MultiBufferOffset(byte_offset), fingerprint) {
-                    results.push(byte_offset);
-                }
-                byte_offset += ch.len_utf8();
-            }
-            results
-        };
-
-        let mut search_start = 0usize;
-        let mut observed_shift: isize = 0;
-
-        let valid_folds: Vec<_> = folds
-            .into_iter()
-            .filter_map(|(stored_start, stored_end, start_fp, end_fp)| {
-                let sfp = start_fp?;
-                let efp = end_fp?;
-                let efp_len = efp.len();
-                let sfp_len = sfp.len();
-                let fold_len = stored_end - stored_start;
-
-                // Fast path: check if fingerprints match at stored offsets
-                let start_matches = stored_start < snapshot_len
-                    && snapshot.contains_str_at(MultiBufferOffset(stored_start), &sfp);
-                let efp_check_pos = stored_end.saturating_sub(efp_len);
-                let end_matches = efp_check_pos >= stored_start
-                    && stored_end <= snapshot_len
-                    && snapshot.contains_str_at(MultiBufferOffset(efp_check_pos), &efp);
-
-                let (new_start, new_end) = if start_matches && end_matches {
-                    (stored_start, stored_end)
-                } else {
-                    let expected_start = (stored_start as isize + observed_shift)
-                        .max(0) as usize;
-
-                    let sfp_matches = find_all_fingerprints(&sfp);
-                    if sfp_matches.is_empty() {
-                        return None;
-                    }
-
-                    if sfp == efp {
-                        // Short fold: sfp and efp are the same text. Pick the
-                        // match closest to expected_start that is >= search_start.
-                        let new_start = sfp_matches
-                            .iter()
-                            .copied()
-                            .filter(|&pos| pos >= search_start)
-                            .min_by_key(|&pos| {
-                                (pos as isize - expected_start as isize).unsigned_abs()
-                            })?;
-                        let new_end = new_start + fold_len;
-                        (new_start, new_end)
-                    } else {
-                        // Long fold: validate each sfp match by checking that
-                        // efp also appears at the expected relative position.
-                        let efp_expected_offset = fold_len.saturating_sub(efp_len);
-                        let mut validated: Vec<(usize, usize)> = sfp_matches
-                            .iter()
-                            .copied()
-                            .filter(|&pos| pos >= search_start)
-                            .filter_map(|start_pos| {
-                                let end_fp_pos = start_pos + efp_expected_offset;
-                                let end_pos = end_fp_pos + efp_len;
-                                if end_pos <= snapshot_len
-                                    && snapshot.contains_str_at(
-                                        MultiBufferOffset(end_fp_pos),
-                                        &efp,
-                                    )
-                                {
-                                    Some((start_pos, end_pos))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        if validated.is_empty() {
-                            // Fallback: efp might have shifted independently.
-                            // Search for efp after each sfp match.
-                            let efp_matches = find_all_fingerprints(&efp);
-                            validated = sfp_matches
-                                .iter()
-                                .copied()
-                                .filter(|&pos| pos >= search_start)
-                                .filter_map(|start_pos| {
-                                    let after_sfp = start_pos + sfp_len;
-                                    efp_matches
-                                        .iter()
-                                        .copied()
-                                        .filter(|&ep| ep >= after_sfp)
-                                        .min()
-                                        .map(|ep| (start_pos, ep + efp_len))
-                                })
-                                .collect();
-                        }
-
-                        let (new_start, new_end) = validated
-                            .into_iter()
-                            .min_by_key(|&(pos, _)| {
-                                (pos as isize - expected_start as isize).unsigned_abs()
-                            })?;
-                        (new_start, new_end)
-                    }
-                };
-
-                if new_end <= new_start || new_end > snapshot_len {
-                    return None;
-                }
-
-                observed_shift = new_start as isize - stored_start as isize;
-                search_start = new_end;
-
-                Some(
-                    snapshot.clip_offset(MultiBufferOffset(new_start), Bias::Left)
-                        ..snapshot.clip_offset(MultiBufferOffset(new_end), Bias::Right),
-                )
-            })
-            .collect();
+        let (valid_folds, _) = Self::reconstruct_fold_positions(&snapshot, folds);
 
         if !valid_folds.is_empty() {
             self.fold_ranges(valid_folds, false, window, cx);

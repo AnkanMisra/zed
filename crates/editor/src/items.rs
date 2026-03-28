@@ -1448,6 +1448,9 @@ impl ProjectItem for Editor {
                 })
         {
             if !restoration_data.folds.is_empty() {
+                // When buffer_byte_len is None (older restoration data that predates
+                // this field), we conservatively apply the folds for backward
+                // compatibility. We only skip when we *know* the buffer changed.
                 let buffer_changed = restoration_data
                     .buffer_byte_len
                     .is_some_and(|len| len != snapshot.len());
