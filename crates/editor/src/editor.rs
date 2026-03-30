@@ -6686,7 +6686,7 @@ impl Editor {
             text: new_text[common_prefix_len..].into(),
         });
 
-        self.transact(window, cx, |editor, window, cx| {
+        let tx_id = self.transact(window, cx, |editor, window, cx| {
             if let Some(mut snippet) = snippet {
                 snippet.text = new_text.to_string();
                 editor
@@ -6768,7 +6768,7 @@ impl Editor {
         }
 
         Some(cx.spawn_in(window, async move |editor, cx| {
-            apply_edits.await?;
+            let additional_edits_tx = apply_edits.await?;
 
             if let Some((lsp_store, command)) = lsp_store.zip(command) {
                 let title = command.lsp_action.title().to_owned();
@@ -6788,6 +6788,18 @@ impl Editor {
                     )
                     .await?;
                 }
+            }
+
+            if let Some(tx_id) = tx_id
+                && let Some(additional_edits_tx) = additional_edits_tx
+            {
+                editor
+                    .update(cx, |editor, cx| {
+                        editor.buffer.update(cx, |buffer, cx| {
+                            buffer.merge_transactions(additional_edits_tx.id, tx_id, cx)
+                        });
+                    })
+                    .context("merge transactions")?;
             }
 
             Ok(())
@@ -14020,6 +14032,8 @@ impl Editor {
             return;
         }
 
+        self.finalize_last_transaction(cx);
+
         let clipboard_text = Cow::Borrowed(text.as_str());
 
         self.transact(window, cx, |this, window, cx| {
@@ -18219,6 +18233,20 @@ impl Editor {
             for ranges in locations.values_mut() {
                 ranges.sort_by_key(|range| (range.start, Reverse(range.end)));
                 ranges.dedup();
+                // Merge overlapping or contained ranges. After sorting by
+                // (start, Reverse(end)), we can merge in a single pass:
+                // if the next range starts before the current one ends,
+                // extend the current range's end if needed.
+                let mut i = 0;
+                while i + 1 < ranges.len() {
+                    if ranges[i + 1].start <= ranges[i].end {
+                        let merged_end = ranges[i].end.max(ranges[i + 1].end);
+                        ranges[i].end = merged_end;
+                        ranges.remove(i + 1);
+                    } else {
+                        i += 1;
+                    }
+                }
                 let fits_in_one_excerpt = ranges
                     .iter()
                     .tuple_windows()
